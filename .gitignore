@@ -1,0 +1,8 @@
+# Environments
+venv/
+
+# Logs
+*.log
+
+# Local Configuration
+*.json
