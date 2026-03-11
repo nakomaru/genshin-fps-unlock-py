@@ -11,7 +11,7 @@ DLL injection can be flagged as malware by Windows Defender and other antivirus 
 
 ### Configuration (`fps_config.json`)
 
-The script automatically generates this file on first run.
+The script automatically generates this file in its directory on first run.
 
 | Option | Description |
 | :--- | :--- |
@@ -31,6 +31,15 @@ The script automatically generates this file on first run.
 
 ### Usage
 1. Close the game completely.
-2. Run `run_fps_unlocker.bat`.
-3. The script will request elevation, launch the game, and run invisibly in the background.
+2. Run the script directly using Python:
+   ```bash
+   python fps_unlocker.py
+   ```
+3. **Self-Bootstrapping**: The script will automatically:
+   - Request **Administrator privileges** (required for memory access).
+   - Create a local **virtual environment** (`.venv_fps_unlocker/`) if it doesn't exist.
+   - Install required dependencies (`pymem`) silently.
+   - Launch the game and run the unlocker service invisibly in the background.
 4. The service exits automatically when the game is closed.
+
+*Note: All files (logs, config, venv) are maintained relative to the script's directory, so it can be called from anywhere or via a shortcut.*

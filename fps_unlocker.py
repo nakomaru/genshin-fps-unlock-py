@@ -1,13 +1,61 @@
-import pymem
-import pymem.process
-import struct
-import time
-import ctypes
 import sys
 import os
 import subprocess
+import ctypes
+import struct
+import time
 import json
 import traceback
+from pathlib import Path
+
+def ensure_bootstrap():
+    """Ensures the script is running with Admin privileges and within a virtual environment."""
+    # 1. Admin Elevation (Windows only)
+    if os.name == 'nt':
+        try:
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                # Relaunch with admin privileges
+                # Use sys.executable to maintain the current interpreter (global or venv)
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{Path(__file__).resolve()}"', None, 1)
+                sys.exit(0)
+        except Exception as e:
+            print(f"Failed to elevate: {e}")
+            sys.exit(1)
+
+    # 2. Virtual Environment Check
+    if sys.prefix != sys.base_prefix:
+        return
+
+    script_dir = Path(__file__).parent.resolve()
+    venv_dir = script_dir / ".venv_fps_unlocker"
+    venv_python = venv_dir / "Scripts" / "python.exe" if os.name == "nt" else venv_dir / "bin" / "python"
+
+    # Create venv if it doesn't exist
+    if not venv_python.exists():
+        import venv
+        print("Creating virtual environment...")
+        venv.create(venv_dir, with_pip=True)
+
+    # Ensure dependencies are installed
+    try:
+        subprocess.check_call([str(venv_python), "-c", "import pymem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print("Installing dependencies (pymem)...")
+        subprocess.check_call([str(venv_python), "-m", "pip", "install", "pymem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 3. Relaunch within the virtual environment
+    try:
+        os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:])
+    except AttributeError:
+        # Fallback for platforms without execv
+        sys.exit(subprocess.call([str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:]))
+
+if __name__ == "__main__":
+    ensure_bootstrap()
+
+# Non-standard imports (must come after bootstrap)
+import pymem
+import pymem.process
 
 # Windows API constants
 SW_HIDE = 0
@@ -39,13 +87,13 @@ DEFAULT_CONFIG = {
     "Logging": True
 }
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
+script_dir = Path(__file__).parent.resolve()
 log_file = None
 
 def setup_logging(config):
     global log_file
     if config.get("Logging", True):
-        log_file_path = os.path.join(script_dir, "fps_unlocker.log")
+        log_file_path = script_dir / "fps_unlocker.log"
         log_file = open(log_file_path, "w", buffering=1)
         sys.stdout = log_file
         sys.stderr = log_file
@@ -56,8 +104,8 @@ def log(message):
         print(f"[{timestamp}] {message}")
 
 def load_config():
-    config_path = os.path.join(script_dir, "fps_config.json")
-    if os.path.exists(config_path):
+    config_path = script_dir / "fps_config.json"
+    if config_path.exists():
         try:
             with open(config_path, "r") as f:
                 return {**DEFAULT_CONFIG, **json.load(f)}
