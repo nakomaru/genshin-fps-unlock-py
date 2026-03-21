@@ -6,6 +6,7 @@ import struct
 import time
 import json
 import traceback
+import signal
 from pathlib import Path
 
 def ensure_bootstrap():
@@ -158,17 +159,83 @@ def snap_window_to_monitor_top_left(pid, config):
         if snapped[0]: break
         time.sleep(0.5)
 
-def find_process():
+def kill_process(pid):
+    """Forcefully terminates a process and verifies its closure."""
+    try:
+        log(f"Terminating process {pid}...")
+        
+        # Attempt termination via SIGTERM (equivalent to TerminateProcess on Windows)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            # Direct API fallback if os.kill fails
+            PROCESS_TERMINATE = 0x0001
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                ctypes.windll.kernel32.CloseHandle(handle)
+
+        # Verify the process has actually exited
+        for _ in range(40):
+            time.sleep(0.1)
+            try:
+                # os.kill(pid, 0) checks for process existence
+                os.kill(pid, 0)
+            except OSError:
+                log(f"Process {pid} confirmed dead.")
+                return True
+                
+        log(f"Process {pid} failed to terminate after timeout.")
+        return False
+    except Exception as e:
+        log(f"Error during termination of process {pid}: {e}")
+        return False
+
+def has_real_window(pid):
+    """Uses Windows API to check if the process has a visible window with a title."""
+    found = [False]
+    
+    def enum_handler(hwnd, lParam):
+        if ctypes.windll.user32.IsWindowVisible(hwnd):
+            window_pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if window_pid.value == pid:
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    found[0] = True
+                    return False
+        return True
+
+    WNDENUMPROC_CALLBACK = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC_CALLBACK(enum_handler), 0)
+    return found[0]
+
+def find_process_with_status():
+    """Locates the game process and evaluates its responsiveness and visibility."""
     for name in ["GenshinImpact.exe", "YuanShen.exe"]:
         try:
-            output = subprocess.check_output(["tasklist", "/FI", f"IMAGENAME eq {name}"], stderr=subprocess.STDOUT, text=True)
-            if name.lower() in output.lower():
-                for line in output.splitlines():
-                    if name.lower() in line.lower():
-                        parts = line.split()
-                        return int(parts[1]), name
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"IMAGENAME eq {name}", "/V", "/FO", "CSV", "/NH"],
+                stderr=subprocess.STDOUT,
+                text=True
+            ).strip()
+            
+            if not output or "no tasks" in output.lower():
+                continue
+
+            lines = output.splitlines()
+            for line in lines:
+                parts = [p.strip('"') for p in line.split(',')]
+                if len(parts) >= 2:
+                    pid = int(parts[1])
+                    status = parts[5].lower()
+                    
+                    is_responding = "not responding" not in status
+                    has_window = has_real_window(pid)
+                    
+                    return pid, name, is_responding, has_window
         except: pass
-    return None, None
+    return None, None, False, False
 
 def unlock_fps():
     config = load_config()
@@ -179,32 +246,51 @@ def unlock_fps():
     module_base = None
     log("--- STARTING BACKGROUND SERVICE ---")
 
-    game_path = config["GamePath"]
-    if not os.path.exists(game_path):
-        log(f"Error: Game not found at {game_path}")
-        return
+    # Assess existing game instances
+    pid, name, is_responding, has_window = find_process_with_status()
+    
+    if pid:
+        # Resolve hanging or invisible processes before proceeding
+        if not is_responding or not has_window:
+            reason = "not responding" if not is_responding else "no visible window"
+            log(f"Detected hanging process ({name}, PID {pid}, {reason}).")
+            if kill_process(pid):
+                pid = None
+            else:
+                log(f"Fatal: Unable to clear hanging process {pid}. Aborting.")
+                return
+        else:
+            log(f"Process {name} (PID {pid}) is already running healthy. Service exiting.")
+            return
+    
+    # Launch fresh game instance if no healthy process is found
+    if not pid:
+        game_path = config["GamePath"]
+        if not os.path.exists(game_path):
+            log(f"Error: Game not found at {game_path}")
+            return
 
-    # Unity Command Line Arguments
-    cmd = [
-        game_path, 
-        "-screen-fullscreen", "1" if config["Fullscreen"] else "0"
-    ]
+        # Unity Command Line Arguments
+        cmd = [
+            game_path, 
+            "-screen-fullscreen", "1" if config["Fullscreen"] else "0"
+        ]
 
-    if config["UseCustomRes"]:
-        cmd.extend([
-            "-screen-width", str(config["CustomResX"]), 
-            "-screen-height", str(config["CustomResY"])
-        ])
+        if config["UseCustomRes"]:
+            cmd.extend([
+                "-screen-width", str(config["CustomResX"]), 
+                "-screen-height", str(config["CustomResY"])
+            ])
 
-    if config["PopupWindow"]: cmd.append("-popupwindow")
-    if config["MonitorNum"]: cmd.extend(["-monitor", str(config["MonitorNum"])])
-    if config["AdditionalCommandLine"]: cmd.extend(config["AdditionalCommandLine"].split())
+        if config["PopupWindow"]: cmd.append("-popupwindow")
+        if config["MonitorNum"]: cmd.extend(["-monitor", str(config["MonitorNum"])])
+        if config["AdditionalCommandLine"]: cmd.extend(config["AdditionalCommandLine"].split())
 
-    log(f"Launching game: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, cwd=os.path.dirname(game_path))
-    pid = proc.pid
+        log(f"Launching game: {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, cwd=os.path.dirname(game_path))
+        pid = proc.pid
 
-    # 1. THE RACE (Immediate Attachment)
+    # Immediate Memory Attachment Loop
     log(f"Attaching to PID {pid}...")
     start_time = time.time()
     while module_base is None:
@@ -213,16 +299,16 @@ def unlock_fps():
             base_val = pm.process_base
             module_base = base_val.lpBaseOfDll if hasattr(base_val, 'lpBaseOfDll') else int(base_val)
             pm.read_bytes(module_base, 1)
-            log(f"WON THE RACE in {int((time.time() - start_time) * 1000)}ms!")
+            log(f"Attachment successful in {int((time.time() - start_time) * 1000)}ms!")
             break
         except:
-            pm = None # Reset to retry full attachment
+            pm = None 
             if time.time() - start_time > 60:
-                log("Fatal: Race timeout.")
+                log("Fatal: Attachment timeout.")
                 return
             continue
 
-    # 2. RESOLVE FPS ADDRESS (Do this before anything else)
+    # Resolve FPS Memory Address
     try:
         e_lfanew = struct.unpack("<I", pm.read_bytes(module_base + 0x3C, 4))[0]
         size_of_image = struct.unpack("<I", pm.read_bytes(module_base + e_lfanew + 0x50, 4))[0]
@@ -261,19 +347,18 @@ def unlock_fps():
     fps_address = curr_rip + struct.unpack("<i", pm.read_bytes(curr_rip + 2, 4))[0] + 6
     log(f"Resolved FPS Address: {hex(fps_address)}")
 
-    # 3. WINDOW SNAPPING (Now happening in background or sequentially)
+    # Window Snap Operation
     if config["PopupWindow"]:
         log("Waiting for window to snap...")
         snap_window_to_monitor_top_left(pid, config)
 
-    # 4. SERVICE LOOP
+    # Active Service Loop
     last_applied_target = -1
     log("FPS Unlock Active.")
     
     while True:
         try:
-            # Detect game exit by checking if we can still read/write
-            # This is more reliable than GetExitCodeProcess when anti-cheat is involved
+            # Verify game health and handle power-saving logic
             pm.write_int(fps_address, pm.read_int(fps_address))
             
             target = config["FPSTarget"]
@@ -282,14 +367,13 @@ def unlock_fps():
             
             if target != last_applied_target:
                 pm.write_int(fps_address, target)
-                log(f"Edit: Applied {target} FPS target.")
+                log(f"Applied {target} FPS target.")
                 last_applied_target = target
             else:
                 pm.write_int(fps_address, target)
             
             time.sleep(0.062)
         except Exception:
-            # If any memory operation fails, the game likely closed or access was lost
             break
 
     log("Game closed. Service stopping.")
