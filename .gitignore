@@ -1,12 +1,2 @@
-# Environments
-.venv*/
-venv/
-.env/
-env/
-python_env/
-
-# Logs
-*.log
-
-# Local Configuration
-*.json
+fps_unlocker.log
+fps_config.json
