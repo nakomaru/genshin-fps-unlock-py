@@ -27,14 +27,15 @@ def ensure_bootstrap():
     if sys.prefix != sys.base_prefix:
         return
 
-    script_dir = Path(__file__).parent.resolve()
-    venv_dir = script_dir / ".venv_fps_unlocker"
+    # Store virtual environment in ~\venvs\.venv_fps_unlocker
+    venv_dir = Path.home() / "venvs" / ".venv_fps_unlocker"
     venv_python = venv_dir / "Scripts" / "python.exe" if os.name == "nt" else venv_dir / "bin" / "python"
 
     # Create venv if it doesn't exist
     if not venv_python.exists():
         import venv
-        print("Creating virtual environment...")
+        print(f"Creating virtual environment at {venv_dir}...")
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
         venv.create(venv_dir, with_pip=True)
 
     # Ensure dependencies are installed
@@ -363,7 +364,7 @@ def unlock_fps():
             
             target = config["FPSTarget"]
             if config["UsePowerSave"] and get_window_thread_process_id(get_foreground_window()) != pid:
-                target = 10
+                target = 15
             
             if target != last_applied_target:
                 pm.write_int(fps_address, target)
