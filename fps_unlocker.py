@@ -2,60 +2,54 @@ import sys
 import os
 import subprocess
 import ctypes
+import csv
 import struct
 import time
 import json
 import traceback
 import signal
+from datetime import datetime
 from pathlib import Path
 
 def ensure_bootstrap():
-    """Ensures the script is running with Admin privileges and within a virtual environment."""
-    # 1. Admin Elevation (Windows only)
+    """Relaunches the script elevated to Administrator, then inside its own virtual environment."""
     if os.name == 'nt':
         try:
             if not ctypes.windll.shell32.IsUserAnAdmin():
-                # Relaunch with admin privileges
-                # Use sys.executable to maintain the current interpreter (global or venv)
+                # sys.executable keeps the current interpreter, global or venv.
                 ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{Path(__file__).resolve()}"', None, 1)
                 sys.exit(0)
         except Exception as e:
             print(f"Failed to elevate: {e}")
             sys.exit(1)
 
-    # 2. Virtual Environment Check
     if sys.prefix != sys.base_prefix:
         return
 
-    # Store virtual environment in ~\venvs\.venv_fps_unlocker
     venv_dir = Path.home() / "venvs" / ".venv_fps_unlocker"
     venv_python = venv_dir / "Scripts" / "python.exe" if os.name == "nt" else venv_dir / "bin" / "python"
 
-    # Create venv if it doesn't exist
     if not venv_python.exists():
         import venv
         print(f"Creating virtual environment at {venv_dir}...")
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
         venv.create(venv_dir, with_pip=True)
 
-    # Ensure dependencies are installed
     try:
         subprocess.check_call([str(venv_python), "-c", "import pymem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
         print("Installing dependencies (pymem)...")
         subprocess.check_call([str(venv_python), "-m", "pip", "install", "pymem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 3. Relaunch within the virtual environment
     try:
         os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:])
     except AttributeError:
-        # Fallback for platforms without execv
         sys.exit(subprocess.call([str(venv_python), str(Path(__file__).resolve())] + sys.argv[1:]))
 
 if __name__ == "__main__":
     ensure_bootstrap()
 
-# Non-standard imports (must come after bootstrap)
+# Imported after bootstrap, which installs it.
 import pymem
 import pymem.process
 
@@ -73,6 +67,8 @@ class RECT(ctypes.Structure):
 class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
 
+WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
 DEFAULT_CONFIG = {
     "GamePath": "C:\\Program Files\\HoYoPlay\\games\\Genshin Impact game\\GenshinImpact.exe",
     "PopupWindow": True,
@@ -80,6 +76,7 @@ DEFAULT_CONFIG = {
     "UseCustomRes": True,
     "UsePowerSave": True,
     "FPSTarget": 120,
+    "PowerSaveFPS": 10,
     "CustomResX": 1920,
     "CustomResY": 1042,
     "PopupPosX": 0,
@@ -88,37 +85,70 @@ DEFAULT_CONFIG = {
     "AdditionalCommandLine": "",
     "Logging": True
 }
+# Settings read again on every pass of the service loop, so an edit applies at once.
+LIVE_KEYS = ("FPSTarget", "UsePowerSave", "PowerSaveFPS")
+SERVICE_INTERVAL = 0.062
 
 script_dir = Path(__file__).parent.resolve()
+config_path = script_dir / "fps_config.json"
 log_file = None
 
 def setup_logging(config):
     global log_file
     if config.get("Logging", True):
-        log_file_path = script_dir / "fps_unlocker.log"
-        log_file = open(log_file_path, "w", buffering=1)
+        log_file = open(script_dir / "fps_unlocker.log", "w", buffering=1, encoding="utf-8", newline="\n")
         sys.stdout = log_file
         sys.stderr = log_file
 
 def log(message):
     if log_file:
-        timestamp = time.strftime('%H:%M:%S')
-        print(f"[{timestamp}] {message}")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"{timestamp} {message}")
 
-def load_config():
-    config_path = script_dir / "fps_config.json"
-    if config_path.exists():
+def config_mtime():
+    try:
+        return config_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+def load_config(previous=None):
+    """The config file merged over the defaults. A missing file is created
+    with the defaults; an unreadable one keeps `previous`, so a half-saved
+    edit never resets live settings."""
+    if not config_path.exists():
         try:
-            with open(config_path, "r") as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
-        except:
-            return DEFAULT_CONFIG
-    else:
-        try:
-            with open(config_path, "w") as f:
+            with open(config_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2)
-        except: pass
-    return DEFAULT_CONFIG
+        except OSError:
+            pass
+        return dict(DEFAULT_CONFIG)
+    fallback = previous if previous is not None else DEFAULT_CONFIG
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = {**DEFAULT_CONFIG, **json.load(f)}
+    except (OSError, ValueError) as e:
+        log(f"Could not read {config_path.name}: {e}")
+        return dict(fallback)
+    for key in ("FPSTarget", "PowerSaveFPS"):
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            log(f"Ignoring {key}: {value!r} is not a positive whole number.")
+            config[key] = fallback[key]
+    return config
+
+def reload_config(config):
+    """Reads the config again and logs what changed."""
+    updated = load_config(config)
+    for key in sorted(set(config) | set(updated)):
+        if config.get(key) != updated.get(key):
+            note = "" if key in LIVE_KEYS else " (applies on next launch)"
+            log(f"Config {key}: {config.get(key)!r} -> {updated.get(key)!r}{note}")
+    return updated
+
+def fps_target(config, pid):
+    if config["UsePowerSave"] and get_window_thread_process_id(get_foreground_window()) != pid:
+        return config["PowerSaveFPS"]
+    return config["FPSTarget"]
 
 def get_foreground_window():
     return ctypes.windll.user32.GetForegroundWindow()
@@ -127,9 +157,6 @@ def get_window_thread_process_id(hwnd):
     pid = ctypes.c_ulong()
     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return pid.value
-
-# Windows API types
-WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
 def snap_window_to_monitor_top_left(pid, config):
     """Finds the game window and moves it to the specified position on its monitor."""
@@ -164,28 +191,24 @@ def kill_process(pid):
     """Forcefully terminates a process and verifies its closure."""
     try:
         log(f"Terminating process {pid}...")
-        
-        # Attempt termination via SIGTERM (equivalent to TerminateProcess on Windows)
+
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
-            # Direct API fallback if os.kill fails
             PROCESS_TERMINATE = 0x0001
             handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
             if handle:
                 ctypes.windll.kernel32.TerminateProcess(handle, 1)
                 ctypes.windll.kernel32.CloseHandle(handle)
 
-        # Verify the process has actually exited
         for _ in range(40):
             time.sleep(0.1)
             try:
-                # os.kill(pid, 0) checks for process existence
                 os.kill(pid, 0)
             except OSError:
                 log(f"Process {pid} confirmed dead.")
                 return True
-                
+
         log(f"Process {pid} failed to terminate after timeout.")
         return False
     except Exception as e:
@@ -193,9 +216,9 @@ def kill_process(pid):
         return False
 
 def has_real_window(pid):
-    """Uses Windows API to check if the process has a visible window with a title."""
+    """Whether the process has a visible window with a title."""
     found = [False]
-    
+
     def enum_handler(hwnd, lParam):
         if ctypes.windll.user32.IsWindowVisible(hwnd):
             window_pid = ctypes.c_ulong()
@@ -207,8 +230,7 @@ def has_real_window(pid):
                     return False
         return True
 
-    WNDENUMPROC_CALLBACK = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    ctypes.windll.user32.EnumWindows(WNDENUMPROC_CALLBACK(enum_handler), 0)
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_handler), 0)
     return found[0]
 
 def find_process_with_status():
@@ -220,38 +242,30 @@ def find_process_with_status():
                 stderr=subprocess.STDOUT,
                 text=True
             ).strip()
-            
-            if not output or "no tasks" in output.lower():
-                continue
+        except (OSError, subprocess.CalledProcessError):
+            continue
 
-            lines = output.splitlines()
-            for line in lines:
-                parts = [p.strip('"') for p in line.split(',')]
-                if len(parts) >= 2:
-                    pid = int(parts[1])
-                    status = parts[5].lower()
-                    
-                    is_responding = "not responding" not in status
-                    has_window = has_real_window(pid)
-                    
-                    return pid, name, is_responding, has_window
-        except: pass
+        # The memory column holds commas of its own ("1,234,567 K"), so the
+        # quoted fields need a real CSV parse.
+        for parts in csv.reader(output.splitlines()):
+            if len(parts) >= 6 and parts[1].isdigit():
+                pid = int(parts[1])
+                is_responding = "not responding" not in parts[5].lower()
+                return pid, name, is_responding, has_real_window(pid)
     return None, None, False, False
 
 def unlock_fps():
     config = load_config()
     setup_logging(config)
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), SW_HIDE)
-    
+
     pm = None
     module_base = None
     log("--- STARTING BACKGROUND SERVICE ---")
 
-    # Assess existing game instances
     pid, name, is_responding, has_window = find_process_with_status()
-    
+
     if pid:
-        # Resolve hanging or invisible processes before proceeding
         if not is_responding or not has_window:
             reason = "not responding" if not is_responding else "no visible window"
             log(f"Detected hanging process ({name}, PID {pid}, {reason}).")
@@ -263,23 +277,22 @@ def unlock_fps():
         else:
             log(f"Process {name} (PID {pid}) is already running healthy. Service exiting.")
             return
-    
-    # Launch fresh game instance if no healthy process is found
+
     if not pid:
         game_path = config["GamePath"]
         if not os.path.exists(game_path):
             log(f"Error: Game not found at {game_path}")
             return
 
-        # Unity Command Line Arguments
+        # Unity command line arguments
         cmd = [
-            game_path, 
+            game_path,
             "-screen-fullscreen", "1" if config["Fullscreen"] else "0"
         ]
 
         if config["UseCustomRes"]:
             cmd.extend([
-                "-screen-width", str(config["CustomResX"]), 
+                "-screen-width", str(config["CustomResX"]),
                 "-screen-height", str(config["CustomResY"])
             ])
 
@@ -291,7 +304,8 @@ def unlock_fps():
         proc = subprocess.Popen(cmd, cwd=os.path.dirname(game_path))
         pid = proc.pid
 
-    # Immediate Memory Attachment Loop
+    # Retries with no pause: memory access has to be won before the
+    # anti-cheat driver locks the process.
     log(f"Attaching to PID {pid}...")
     start_time = time.time()
     while module_base is None:
@@ -302,21 +316,20 @@ def unlock_fps():
             pm.read_bytes(module_base, 1)
             log(f"Attachment successful in {int((time.time() - start_time) * 1000)}ms!")
             break
-        except:
-            pm = None 
+        except Exception:
+            pm = None
+            module_base = None
             if time.time() - start_time > 60:
                 log("Fatal: Attachment timeout.")
                 return
-            continue
 
-    # Resolve FPS Memory Address
     try:
         e_lfanew = struct.unpack("<I", pm.read_bytes(module_base + 0x3C, 4))[0]
         size_of_image = struct.unpack("<I", pm.read_bytes(module_base + e_lfanew + 0x50, 4))[0]
     except Exception as e:
         log(f"Fatal: Could not read PE headers: {e}")
         return
-    
+
     log("Scanning for FPS pattern...")
     pattern = b"\xB9\x3C\x00\x00\x00\xE8"
     match_addr = None
@@ -324,18 +337,19 @@ def unlock_fps():
     for i in range(0, size_of_image, chunk_size):
         try:
             data = pm.read_bytes(module_base + i, min(chunk_size, size_of_image - i))
-            idx = data.find(pattern)
-            if idx != -1:
-                match_addr = module_base + i + idx
-                break
-        except: continue
+        except Exception:
+            continue
+        idx = data.find(pattern)
+        if idx != -1:
+            match_addr = module_base + i + idx
+            break
 
     if not match_addr:
         log("Error: FPS Pattern not found.")
         return
 
-    rip = match_addr + 5
-    curr_rip = rip
+    # Follows call/jmp chains from the match to the instruction that loads the FPS value.
+    curr_rip = match_addr + 5
     for _ in range(10):
         try:
             instr = pm.read_bytes(curr_rip, 1)[0]
@@ -343,39 +357,36 @@ def unlock_fps():
                 d = struct.unpack("<i", pm.read_bytes(curr_rip + 1, 4))[0]
                 curr_rip = curr_rip + d + 5
             else: break
-        except: break
-    
+        except Exception: break
+
     fps_address = curr_rip + struct.unpack("<i", pm.read_bytes(curr_rip + 2, 4))[0] + 6
     log(f"Resolved FPS Address: {hex(fps_address)}")
 
-    # Window Snap Operation
     if config["PopupWindow"]:
         log("Waiting for window to snap...")
         snap_window_to_monitor_top_left(pid, config)
 
-    # Active Service Loop
-    last_applied_target = -1
+    last_applied_target = None
+    last_mtime = config_mtime()
     log("FPS Unlock Active.")
-    
+
     while True:
+        mtime = config_mtime()
+        if mtime != last_mtime:
+            last_mtime = mtime
+            config = reload_config(config)
+
+        target = fps_target(config, pid)
+        # Written on every pass; the write failing means the game has exited.
         try:
-            # Verify game health and handle power-saving logic
-            pm.write_int(fps_address, pm.read_int(fps_address))
-            
-            target = config["FPSTarget"]
-            if config["UsePowerSave"] and get_window_thread_process_id(get_foreground_window()) != pid:
-                target = 15
-            
-            if target != last_applied_target:
-                pm.write_int(fps_address, target)
-                log(f"Applied {target} FPS target.")
-                last_applied_target = target
-            else:
-                pm.write_int(fps_address, target)
-            
-            time.sleep(0.062)
+            pm.write_int(fps_address, target)
         except Exception:
             break
+        if target != last_applied_target:
+            log(f"Applied {target} FPS target.")
+            last_applied_target = target
+
+        time.sleep(SERVICE_INTERVAL)
 
     log("Game closed. Service stopping.")
     if log_file: log_file.close()
